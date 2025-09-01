@@ -1,4 +1,11 @@
+# Mooncake
+
+
+
+
+
 # RDMA全局配置
+
 ```c
 namespace mooncake {
 struct GlobalConfig {
@@ -30,7 +37,13 @@ struct GlobalConfig {
 ```
 
 
+
+
+
+
+
 # 构造RDMA端点
+
 ```c
 int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
                             size_t max_sge_per_wr, size_t max_wr_depth,
@@ -75,7 +88,13 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
 ```
 
 
+
+
+
+
+
 # RDMA通信建连
+
 ```c
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     uint16_t peer_lid,
@@ -200,7 +219,14 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
 }
 ```
 
+
+
+
+
+
+
 # 一次poll64个cqe
+
 ```c
 void WorkerPool::performPollCq(int thread_id) {
     int processed_slice_count = 0;
@@ -215,7 +241,10 @@ void WorkerPool::performPollCq(int thread_id) {
 
 
 
+
+
 # RDMA端点和建连
+
 ```c
 namespace mooncake {
 
@@ -253,19 +282,43 @@ class RdmaEndPoint {
 ```
 
 
+
+
+
 # 查看环境变量
+
 ```c
 const char *num_qp_per_ep_env = std::getenv("MC_NUM_QP_PER_EP");
 ```
 
 
-# 传输层文档
+
+
+
+# 传输层/引擎
+
+## 文档
+
+https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/transfer-engine.md
+
 ```bash
 doc/en/transfer-engine.md
 ```
 
 
+
+# 要点
+
+- 分段和批量传输
+- 批量batch非连续, 异步
+- 
+
+
+
+
+
 # Allreduce vs nccl
+
 你提到的 **Kimi（Moonshot AI）使用的 Mooncake AllReduce** 与常见的 **NCCL AllReduce** 是两种在底层通信方式和设计哲学上各有差异的分布式通信实现。
 
 下面我为你系统比较 **Mooncake AllReduce** 和 **NCCL AllReduce**，从性能、架构、适用场景、优化策略等角度进行分析：
@@ -358,6 +411,40 @@ doc/en/transfer-engine.md
 ---
 
 如果你有实际通信瓶颈或想做 NCCL 低延迟调优（例如 enqueue 排队机制、parallel channel 配置），我也可以继续深入分析。需要的话可以提供你的集群拓扑和训练框架环境，我可以为你定制建议。
+
+
+
+
+
+# 发送调用栈
+
+```c
+Status RdmaTransport::submitTransfer | Status RdmaTransport::submitTransferTask | 
+    int RdmaEndPoint::submitPostSend
+        ibv_post_send
+```
+
+## 核心接口
+
+- submitTransfer
+
+
+
+## 业务调用栈
+
+```c
+TransferWrite | TransferRead
+    ErrorCode Client::TransferData
+        std::optional<TransferFuture> TransferSubmitter::submit
+            std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation
+                Status s = engine_.submitTransfer(batch_id, requests)
+```
+
+以write为例
+
+```c
+tl::expected<void, ErrorCode> Client::Put
+```
 
 
 
