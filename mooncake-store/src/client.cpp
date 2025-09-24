@@ -95,7 +95,7 @@ Client::~Client() {
     }
 }
 
-static bool get_auto_discover() {
+static std::optional<bool> get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
         int iv = std::stoi(ev_ad);
@@ -111,7 +111,7 @@ static bool get_auto_discover() {
                 << ", should be 0 or 1, using default: auto discovery not set";
         }
     }
-    return true;
+    return std::nullopt;
 }
 
 static inline void ltrim(std::string& s) {
@@ -202,14 +202,31 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return err;
         }
 
-        // Start Ping thread to monitor master view changes and remount segments
-        // if needed
+        // Start ping thread to monitor master health and trigger remount if
+        // needed.
         ping_running_ = true;
-        ping_thread_ = std::thread(&Client::PingThreadFunc, this);
+        bool is_ha_mode = true;
+        std::string current_master_address = master_address;
+        ping_thread_ = std::thread([this, is_ha_mode,
+                                    current_master_address]() mutable {
+            this->PingThreadMain(is_ha_mode, std::move(current_master_address));
+        });
 
         return ErrorCode::OK;
     } else {
-        return master_client_.Connect(master_server_entry);
+        auto err = master_client_.Connect(master_server_entry);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        // Non-HA mode also enables heartbeat/ping
+        ping_running_ = true;
+        bool is_ha_mode = false;
+        std::string current_master_address = master_server_entry;
+        ping_thread_ = std::thread([this, is_ha_mode,
+                                    current_master_address]() mutable {
+            this->PingThreadMain(is_ha_mode, std::move(current_master_address));
+        });
+        return ErrorCode::OK;
     }
 }
 
@@ -218,7 +235,20 @@ ErrorCode Client::InitTransferEngine(
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
     // get auto_discover and filters from env
-    bool auto_discover = get_auto_discover();
+    std::optional<bool> env_auto_discover = get_auto_discover();
+    bool auto_discover = false;
+    if (env_auto_discover.has_value()) {
+        // Use user-specified auto-discover setting
+        auto_discover = env_auto_discover.value();
+    } else {
+        // Enable auto-discover for RDMA if no devices are specified
+        if (protocol == "rdma" && !device_names.has_value()) {
+            LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
+                         "since no "
+                         "device names provided";
+            auto_discover = true;
+        }
+    }
     transfer_engine_.setAutoDiscover(auto_discover);
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
@@ -286,6 +316,24 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "ascend") {
+            if (device_names.has_value()) {
+                LOG(WARNING)
+                    << "Ascend protocol does not use device names, ignoring";
+            }
+            try {
+                transport =
+                    transfer_engine_.installTransport("ascend", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "ascend_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install Ascend transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
@@ -293,8 +341,10 @@ ErrorCode Client::InitTransferEngine(
     }
 
     // Initialize TransferSubmitter after transfer engine is ready
+    // Keep using logical local_hostname for name-based behaviors; endpoint is
+    // used separately where needed.
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        transfer_engine_, local_hostname, storage_backend_,
+        transfer_engine_, storage_backend_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 
     return ErrorCode::OK;
@@ -1100,8 +1150,20 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    Segment segment(generate_uuid(), local_hostname_,
-                    reinterpret_cast<uintptr_t>(buffer), size);
+    // Build segment with logical name; attach TE endpoint for transport
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = local_hostname_;
+    segment.base = reinterpret_cast<uintptr_t>(buffer);
+    segment.size = size;
+    // For P2P handshake mode, publish the actual transport endpoint that was
+    // negotiated by the transfer engine. Otherwise, keep the logical hostname
+    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
+    if (metadata_connstring_ == P2PHANDSHAKE) {
+        segment.te_endpoint = transfer_engine_.getLocalIpAndPort();
+    } else {
+        segment.te_endpoint = local_hostname_;
+    }
 
     auto mount_result = master_client_.MountSegment(segment, client_id_);
     if (!mount_result) {
@@ -1314,7 +1376,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
 }
 
-void Client::PingThreadFunc() {
+void Client::PingThreadMain(bool is_ha_mode,
+                            std::string current_master_address) {
     // How many failed pings before getting latest master view from etcd
     const int max_ping_fail_count = 3;
     // How long to wait for next ping after success
@@ -1379,32 +1442,50 @@ void Client::PingThreadFunc() {
             continue;
         }
 
-        // Too many ping failures, we need to check if the master view
-        // has changed
-        LOG(ERROR) << "Failed to ping master for " << ping_fail_count
-                   << " times, try to get latest master view and reconnect";
-        std::string master_address;
-        ViewVersionId next_version = 0;
-        auto err =
-            master_view_helper_.GetMasterView(master_address, next_version);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to get new master view: " << toString(err);
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(fail_ping_interval_ms));
-            continue;
-        }
+        // Exceeded ping failure threshold. Reconnect based on mode.
+        if (is_ha_mode) {
+            LOG(ERROR)
+                << "Failed to ping master for " << ping_fail_count
+                << " times; fetching latest master view and reconnecting";
+            std::string master_address;
+            ViewVersionId next_version = 0;
+            auto err =
+                master_view_helper_.GetMasterView(master_address, next_version);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to get new master view: "
+                           << toString(err);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(fail_ping_interval_ms));
+                continue;
+            }
 
-        err = master_client_.Connect(master_address);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to master " << master_address
-                       << ": " << toString(err);
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(fail_ping_interval_ms));
-            continue;
-        }
+            err = master_client_.Connect(master_address);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to connect to master " << master_address
+                           << ": " << toString(err);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(fail_ping_interval_ms));
+                continue;
+            }
 
-        LOG(INFO) << "Reconnected to master " << master_address;
-        ping_fail_count = 0;
+            current_master_address = master_address;
+            LOG(INFO) << "Reconnected to master " << master_address;
+            ping_fail_count = 0;
+        } else {
+            LOG(ERROR) << "Failed to ping master for " << ping_fail_count
+                       << " times (non-HA); reconnecting to "
+                       << current_master_address;
+            auto err = master_client_.Connect(current_master_address);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "Reconnect failed to " << current_master_address
+                           << ": " << toString(err);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(fail_ping_interval_ms));
+                continue;
+            }
+            LOG(INFO) << "Reconnected to master " << current_master_address;
+            ping_fail_count = 0;
+        }
     }
     // Explicitly wait for the remount segment thread to finish
     if (remount_segment_future.valid()) {

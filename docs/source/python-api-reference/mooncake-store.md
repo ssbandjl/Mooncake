@@ -11,28 +11,24 @@ pip install mooncake-transfer-engine
 
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)
 
-### Required Services
-The following services need to be started separately:
+### Required Service
+Only one service is required now:
 
-- **`mooncake_master`** - Central coordination service managing cluster state and data distribution
-- **`mooncake_http_metadata_server`** - HTTP-based metadata server for Transfer Engine coordination
-- **`mooncake_store_service.py`** - Python service for running Mooncake Store as standalone process with REST API
+- `mooncake_master` — Master service which now embeds the HTTP metadata server
 
 ## Quick Start
 
-### Start Required Services
+### Start Master (with HTTP enabled)
 
-Before using the store, start the master and metadata services:
+Enable the built-in HTTP metadata server when starting the master:
 
 ```bash
-# Start master service (default port 50051)
-mooncake_master
+mooncake_master \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080
 ```
-Start the HTTP metadata server (default port 8080) for transfer engine metadata:
-```bash
-# Start HTTP metadata server (default port 8080) 
-mooncake_http_metadata_server
-```
+This exposes the metadata endpoint at `http://<host>:<port>/metadata`.
 
 ### Hello World Example
 
@@ -44,13 +40,13 @@ store = MooncakeDistributedStore()
 
 # 2. Setup with all required parameters
 store.setup(
-    "localhost:12345",           # Your node's address
+    "localhost",           # Your node's address
     "http://localhost:8080/metadata",    # HTTP metadata server
     512*1024*1024,          # 512MB segment size
     128*1024*1024,          # 128MB local buffer
     "tcp",                             # Use TCP (RDMA for high performance)
-    "",                            # Empty for TCP, specify device for RDMA
-    "localhost:50051"        # Master service
+    "",                            # Leave empty; Mooncake auto-picks RDMA devices when needed
+    "localhost"        # Master service
 )
 
 # 3. Store data
@@ -61,6 +57,33 @@ data = store.get("hello_key")
 print(data.decode())  # Output: Hello, Mooncake Store!
 
 # 5. Clean up
+store.close()
+```
+
+**RDMA device selection**: Leave `rdma_devices` as `""` to auto-select RDMA NICs. Provide a comma-separated list (e.g. `"mlx5_0,mlx5_1"`) to pin to specific hardware.
+
+Mooncake selects available ports internally at `setup() `, so you do not need to fix specific port numbers in these examples. Internally, ports are chosen from a dynamic range (currently 12300–14300).
+
+#### P2P Hello World (preview)
+
+The following setup uses the new P2P handshake and does not require an HTTP metadata server. This feature is not released yet; use only if you’re testing the latest code.
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup(
+    "localhost",           # Your node's ip address
+    "P2PHANDSHAKE",              # P2P handshake (no HTTP metadata)
+    512*1024*1024,                # 512MB segment size
+    128*1024*1024,                # 128MB local buffer
+    "tcp",                       # Use TCP (RDMA for high performance)
+    "",                          # Leave empty; Mooncake auto-picks RDMA devices when needed
+    "localhost:50051"           # Master service
+)
+
+store.put("hello_key", b"Hello, Mooncake Store!")
+print(store.get("hello_key").decode())
 store.close()
 ```
 
@@ -78,7 +101,7 @@ from mooncake.store import MooncakeDistributedStore
 
 # 1. Initialize
 store = MooncakeDistributedStore()
-store.setup("localhost:12345",
+store.setup("localhost",
             "http://localhost:8080/metadata",
             512*1024*1024,
             128*1024*1024,
@@ -132,7 +155,7 @@ from mooncake.store import MooncakeDistributedStore
 
 # Initialize store
 store = MooncakeDistributedStore()
-store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
 # Create a large buffer
 buffer = np.zeros(100 * 1024 * 1024, dtype=np.uint8)  # 100MB buffer
@@ -168,7 +191,7 @@ from mooncake.store import MooncakeDistributedStore
 
 # Initialize store with RDMA protocol for maximum performance
 store = MooncakeDistributedStore()
-store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 16*1024*1024, "tcp", "", "localhost:50051")
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 16*1024*1024, "tcp", "", "localhost:50051")
 
 # Create data to store
 original_data = np.random.randn(1000, 1000).astype(np.float32)
@@ -287,7 +310,7 @@ config.with_soft_pin = True  # Keep this object in memory longer
 config = ReplicateConfig()
 
 # Preferred replica location ("host:port")
-config.preferred_segment = "node1_ip:12345"    # pin to node1
+config.preferred_segment = "localhost:12345"     # pin to a specific machine
 
 # Alternatively, pin to the local host
 config.preferred_segment = self.get_hostname()
@@ -311,7 +334,7 @@ from mooncake.store import MooncakeDistributedStore
 
 # Initialize (same as zero-copy)
 store = MooncakeDistributedStore()
-store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
 # Simple put/get (automatic memory management)
 data = b"Hello, World!" * 1000  # ~13KB
@@ -349,6 +372,42 @@ print("Retrieved all keys successfully:", retrieved == values)
 - Scenarios where network round-trip reduction is beneficial
 
 ---
+
+## Topology & Devices
+
+- Auto-discovery: Disabled by default. For `protocol="rdma"`, you must specify RDMA devices.
+- Enable auto-discovery (optional):
+  - `MC_MS_AUTO_DISC=1` enables auto-discovery; then `rdma_devices` is not required.
+  - Optionally restrict candidates with `MC_MS_FILTERS`, a comma-separated whitelist of NIC names, e.g. `MC_MS_FILTERS=mlx5_0,mlx5_2`.
+  - If `MC_MS_AUTO_DISC` is not set or set to `0`, auto-discovery remains disabled and `rdma_devices` is required for RDMA.
+
+Examples:
+
+```bash
+# Auto-select with default settings
+python - <<'PY'
+from mooncake.store import MooncakeDistributedStore as S
+s = S()
+s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
+PY
+
+# Manual device list 
+unset MC_MS_AUTO_DISC
+python - <<'PY'
+from mooncake.store import MooncakeDistributedStore as S
+s = S()
+s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
+PY
+
+# Auto-select with filters
+export MC_MS_AUTO_DISC=1
+export MC_MS_FILTERS=mlx5_0,mlx5_2
+python - <<'PY'
+from mooncake.store import MooncakeDistributedStore as S
+s = S()
+s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
+PY
+```
 
 ## get_buffer Buffer Protocol
 
@@ -410,12 +469,12 @@ def setup(
 ```
 
 **Parameters:**
-- `local_hostname` (str): **Required**. Local hostname and port (e.g., "localhost:12345")
+- `local_hostname` (str): **Required**. Local hostname and port (e.g., "localhost" or "localhost:12345")
 - `metadata_server` (str): **Required**. Metadata server address (e.g., "http://localhost:8080/metadata")
 - `global_segment_size` (int): Memory segment size in bytes for mounting (default: 16MB = 16777216)
 - `local_buffer_size` (int): Local buffer size in bytes (default: 1GB = 1073741824)
 - `protocol` (str): Network protocol - "tcp" or "rdma" (default: "tcp")
-- `rdma_devices` (str): Hardware device identifier for RDMA (e.g., "mlx5_0", "ib0"). Leave empty for TCP.
+- `rdma_devices` (str): RDMA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-select NICs. Provide device names to pin the NICs. Always empty for TCP.
 - `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
 
 **Returns:**
@@ -428,10 +487,13 @@ def setup(
 
 ```python
 # TCP initialization
-store.setup("localhost:12345", "http://localhost:8080/metadata", 1024*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+store.setup("localhost", "http://localhost:8080/metadata", 1024*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
-# RDMA initialization
-store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0", "localhost:50051")
+# RDMA auto-detect 
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
+
+# RDMA with explicit device list
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
 ```
 
 </details>
