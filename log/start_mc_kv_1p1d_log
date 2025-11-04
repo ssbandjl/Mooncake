@@ -1,0 +1,10 @@
+root@yunqiao-41:/vllm-workspace/vllm/1p1d# ./start_mooncake_2.sh 
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+W0905 08:40:01.303838    38 master.cpp:137] port is deprecated, use rpc_port instead
+I0905 08:40:01.304067    38 master.cpp:305] Master service started on port 18100, enable_gc=0, max_threads=4, enable_metric_reporting=1, metrics_port=18101, default_kv_lease_ttl=5000, default_kv_soft_pin_ttl=1800000, allow_evict_soft_pinned_objects=1, eviction_ratio=0.1, eviction_high_watermark_ratio=0.8, enable_ha=0, etcd_endpoints=, client_ttl=10, rpc_thread_num=4, rpc_port=18100, rpc_address=0.0.0.0, rpc_conn_timeout_seconds=0, rpc_enable_tcp_no_delay=1, cluster_id=mooncake_cluster, root_fs_dir=, memory_allocator=offset
+I0905 08:40:01.348917    38 master_service.cpp:49] action=start_gc_thread
+I0905 08:40:01.349061    50 master_service.cpp:718] action=gc_thread_started
+I0905 08:40:01.349412    38 rpc_service.cpp:182] HTTP metrics server started on port 18101
+I0905 08:40:01.350665    56 rpc_service.cpp:50] Master Metrics: Storage: 0 B / 0 B | Keys: 0 (soft-pinned: 0) | Requests (Success/Total): PutStart=0/0, PutEnd=0/0, PutRevoke=0/0, Get=0/0, Exist=0/0, Del=0/0, DelAll=0/0,  | Batch Requests (Req=Success/PartialSuccess/Total, Item=Success/Total): PutStart:(Req=0/0/0, Item=0/0), PutEnd:(Req=0/0/0, Item=0/0), PutRevoke:(Req=0/0/0, Item=0/0), Get:(Req=0/0/0, Item=0/0), ExistKey:(Req=0/0/0, Item=0/0),  | Eviction: Success/Attempts=0/0, keys=0, size=0 B
+
+

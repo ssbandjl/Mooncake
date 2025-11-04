@@ -307,10 +307,13 @@ doc/en/transfer-engine.md
 
 
 
-# 要点
+# Mooncake传输引擎(TransferEngine)技术要点
+
+https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/transfer-engine.md
 
 - 分段和批量传输
 - 批量batch非连续, 异步
+- transfer_engine.h 中实现了关键类 TransferEngine
 - 
 
 
@@ -448,3 +451,21 @@ tl::expected<void, ErrorCode> Client::Put
 
 
 
+
+
+# RDMA PR
+```bash
+mooncake::getMemoryLocation(start, size - 1024 * 4, only_first_page);
+
+registerLocalMemory
+
+单元测试: mooncake-transfer-engine\tests\memory_location_test.cpp
+```
+
+
+
+# basic test
+```bash
+mooncake-store\tests\client_integration_test.cpp
+
+```
