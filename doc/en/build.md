@@ -2,15 +2,22 @@
 
 This document describes how to build Mooncake from source.
 
-- Note: we have prebuild the pypi wheel for Ubuntu 22.04/24.04, you can simply install mooncake with pip/pip3.
-   ```bash
-   pip3 install mooncake-transfer-engine --upgrade
-   ```
-- To install with the Mooncake Backend and Mooncake EP support, use the following command:
-   ```bash
-   # replace torch2.8.0 with the corresponding version
-   pip3 install mooncake-transfer-engine==0.3.7+ep --upgrade
-   ```
+- Note:
+   - we have prebuild the PyPI wheel for Ubuntu 22.04/24.04, you can simply install mooncake with pip/pip3.
+      ```bash
+      pip3 install mooncake-transfer-engine --upgrade
+      ```
+   - Starting from version 0.3.7, the mooncake-transfer-engine wheel package from PyPI requires that CUDA be installed in the user environment. If your environment reports the following error:
+     ```bash
+     Traceback (most recent call last):
+     File "<string>", line 1, in <module>
+      ImportError: libcudart.so.12: cannot open shared object file: No such file or directory
+     ```
+     Please switch to the following PyPI wheel:
+     ```bash
+      pip install mooncake-transfer-engine-non-cuda
+      ```
+     Or you can include `-DUSE_CUDA=OFF` and compile from the source code.
 
 ## Automatic
 

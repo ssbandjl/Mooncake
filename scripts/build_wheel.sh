@@ -62,8 +62,22 @@ echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
 
+# Handle package name modification for non-CUDA builds
+if [ "$NON_CUDA_BUILD" = "1" ]; then
+    echo "Modifying package name for non-CUDA build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-non-cuda"/' pyproject.toml
+    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (Non-CUDA version)"/' pyproject.toml
+    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "non-cuda"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-non-cuda"
+else
+    echo "Using standard package name: mooncake-transfer-engine"
+fi
+
 echo "Cleaning up previous build artifacts..."
-rm -rf ${OUTPUT_DIR}/ 
+rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
@@ -89,7 +103,11 @@ fi
 
 if [ "$PYTHON_VERSION" = "3.8" ]; then
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    python -m build --wheel --outdir ${OUTPUT_DIR}
+    if [ "$BUILD_WITH_EP" = "1" ]; then
+        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
+    else
+        python -m build --wheel --outdir ${OUTPUT_DIR}
+    fi
 
     echo "python 3.8 auditwheel does not support wild-cards..."
     PATTERNS=(

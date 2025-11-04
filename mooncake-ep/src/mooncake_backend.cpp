@@ -16,8 +16,9 @@ constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
-TransferEngine MooncakeBackend::engine_ = TransferEngine(true);
+TransferEngine MooncakeBackend::engine_ = TransferEngine();
 Transport* MooncakeBackend::transport_ = nullptr;
+std::vector<std::string> MooncakeBackend::hca_filters_;
 int MooncakeBackend::backendIndex_ = 0;
 MooncakeWorker MooncakeBackend::worker_;
 
@@ -33,7 +34,11 @@ MooncakeBackend::MooncakeBackend(
     // Initialize transfer engine
     if (!transport_) {
         engine_.init(P2PHANDSHAKE, hostIp_);
-        transport_ = engine_.installTransport("rdma", nullptr);
+        std::string topology = getCudaTopologyJson(hca_filters_);
+        void** args = (void**)malloc(2 * sizeof(void*));
+        args[0] = (void*)topology.c_str();
+        args[1] = nullptr;
+        transport_ = engine_.installTransport("rdma", args);
         TORCH_CHECK(transport_ != nullptr,
                     c10::str("Failed to install transport"));
     }
@@ -99,13 +104,22 @@ MooncakeBackend::MooncakeBackend(
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
+    // Reset the synchronization signal
+    store->deleteKey("backend_init_" + std::to_string(backendIndex_) + "_" +
+                     std::to_string(rank_));
+    store->deleteKey("backend_warmup_" + std::to_string(backendIndex_) + "_" +
+                     std::to_string(rank_));
+
     // Sync metadata
-    store->set("server_name_" + std::to_string(rank), localServerName);
+    store->set("server_name_" + std::to_string(backendIndex_) + "_" +
+                   std::to_string(rank_),
+               localServerName);
 
     std::vector<std::string> server_names;
     for (int i = 0; i < size; i++) {
-        server_names.push_back(
-            store->get_to_str({"server_name_" + std::to_string(i)}));
+        server_names.push_back(store->get_to_str("server_name_" +
+                                                 std::to_string(backendIndex_) +
+                                                 "_" + std::to_string(i)));
     }
 
     meta_.rank = rank;
@@ -135,6 +149,8 @@ MooncakeBackend::MooncakeBackend(
     }
     meta_.engine = &engine_;
     meta_.bufferBaseIndex = backendIndex_ * 8;
+    meta_.segmentIDs.clear();
+    meta_.segmentDescs.clear();
     for (int i = 0; i < size_; ++i) {
         auto segment_id = engine_.openSegment(server_names[i]);
         meta_.segmentIDs.emplace_back(segment_id);
@@ -156,6 +172,15 @@ MooncakeBackend::MooncakeBackend(
                 .length = sizeof(int32_t),
             });
         }
+        store->set("backend_warmup_" + std::to_string(backendIndex_) + "_" +
+                       std::to_string(rank_),
+                   "1");
+        // Ensure all backends have received peer data
+        for (int i = 0; i < size_; i++) {
+            store->get_to_str("backend_warmup_" +
+                              std::to_string(backendIndex_) + "_" +
+                              std::to_string(i));
+        }
         auto batchID = engine_.allocateBatchID(entries.size());
         engine_.submitTransfer(batchID, entries);
 
@@ -174,29 +199,22 @@ MooncakeBackend::MooncakeBackend(
                 break;
             }
         }
-
-        store->set("warmup_done_" + std::to_string(rank_), "1");
-        for (int i = 0; i < size_; i++) {
-            store->get_to_str("warmup_done_" + std::to_string(i));
-        }
     }
+    store->set("backend_init_" + std::to_string(backendIndex_) + "_" +
+                   std::to_string(rank_),
+               "1");
+
+    // Ensure that all ranks have been initialized
+    for (int i = 0; i < size_; i++) {
+        store->get_to_str("backend_init_" + std::to_string(backendIndex_) +
+                          "_" + std::to_string(i));
+    }
+
+    store->deleteKey("server_name_" + std::to_string(backendIndex_) + "_" +
+                     std::to_string(rank_));
 
     // Increment backend index
     ++backendIndex_;
-}
-
-MooncakeBackend::~MooncakeBackend() {
-    for (size_t i = 0; i < 2; i++) {
-        delete[] cpu_sync_send_region_[i];
-        delete[] cpu_sync_recv_region_[i];
-        if (isCpu_) {
-            free(send_buffer_[i]);
-            free(recv_buffer_[i]);
-        } else {
-            cudaFree(send_buffer_[i]);
-            cudaFree(recv_buffer_[i]);
-        }
-    }
 }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
@@ -440,5 +458,24 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     return worker_.putTaskCpu(
         c10d::OpType::BARRIER, 0, 0, &meta_, [=](void*, size_t, size_t) {},
         [=](void*, size_t, size_t) {});
+}
+
+void MooncakeBackend::shutdown() {
+    for (size_t i = 0; i < 2; i++) {
+        engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
+        engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
+        engine_.unregisterLocalMemory(send_buffer_[i]);
+        engine_.unregisterLocalMemory(recv_buffer_[i]);
+        delete[] cpu_sync_send_region_[i];
+        delete[] cpu_sync_recv_region_[i];
+        if (isCpu_) {
+            free(send_buffer_[i]);
+            free(recv_buffer_[i]);
+        } else {
+            cudaFree(send_buffer_[i]);
+            cudaFree(recv_buffer_[i]);
+        }
+    }
+    --backendIndex_;
 }
 }  // namespace mooncake
