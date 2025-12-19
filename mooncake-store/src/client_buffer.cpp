@@ -3,9 +3,26 @@
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
+#include <sys/mman.h>  // For shm_open, mmap, munmap
+#include <sys/stat.h>  // For S_IRUSR, S_IWUSR
+#include <fcntl.h>     // For O_CREAT, O_RDWR
+#include <unistd.h>    // For ftruncate, close, shm_unlink
+
 #include "utils.h"
 
 namespace mooncake {
+
+std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
+    size_t size, const std::string& protocol) {
+    return std::shared_ptr<ClientBufferAllocator>(
+        new ClientBufferAllocator(size, protocol));
+}
+
+std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
+    void* addr, size_t size, const std::string& protocol) {
+    return std::shared_ptr<ClientBufferAllocator>(
+        new ClientBufferAllocator(addr, size, protocol));
+}
 
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
                                              const std::string& protocol)
@@ -21,9 +38,18 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
         reinterpret_cast<uint64_t>(buffer_), size);
 }
 
+ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
+                                             const std::string& protocol)
+    : protocol(protocol), buffer_size_(size) {
+    buffer_ = addr;
+    is_external_memory_ = true;
+    allocator_ = mooncake::offset_allocator::OffsetAllocator::create(
+        reinterpret_cast<uint64_t>(buffer_), size);
+}
+
 ClientBufferAllocator::~ClientBufferAllocator() {
-    // Free the aligned allocated memory
-    if (buffer_) {
+    // Free the aligned allocated memory or unmap shared memory
+    if (!is_external_memory_ && buffer_) {
         free_memory(protocol, buffer_);
     }
 }
@@ -72,36 +98,29 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         auto& disk_descriptor = replica.get_disk_descriptor();
         total_length = disk_descriptor.object_size;
     } else {
-        for (auto& handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            total_length += handle.size_;
-        }
+        total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
     }
     return total_length;
 }
 
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica,
-                   BufferHandle& buffer_handle) {
-    uint64_t offset = 0;
+                   const Replica::Descriptor& replica, void* buffer_ptr) {
     if (replica.is_memory_replica() == false) {
         // For disk-based replica, split into slices based on file size
+        uint64_t offset = 0;
         uint64_t total_length = replica.get_disk_descriptor().object_size;
         while (offset < total_length) {
             auto chunk_size = std::min(total_length - offset, kMaxSliceSize);
-            void* chunk_ptr = static_cast<char*>(buffer_handle.ptr()) + offset;
+            void* chunk_ptr = static_cast<char*>(buffer_ptr) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
     } else {
         // For memory-based replica, split into slices based on buffer
         // descriptors
-        for (auto& handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            void* chunk_ptr = static_cast<char*>(buffer_handle.ptr()) + offset;
-            slices.emplace_back(Slice{chunk_ptr, handle.size_});
-            offset += handle.size_;
-        }
+        auto& handle = replica.get_memory_descriptor().buffer_descriptor;
+        void* chunk_ptr = buffer_ptr;
+        slices.emplace_back(Slice{chunk_ptr, handle.size_});
     }
     return 0;
 }

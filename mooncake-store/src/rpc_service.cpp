@@ -18,6 +18,7 @@
 #include "rpc_helper.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -29,8 +30,6 @@ WrappedMasterService::WrappedMasterService(
       http_server_(4, config.http_port),
       metric_report_running_(config.enable_metric_reporting) {
     init_http_server();
-
-    MasterMetricManager::instance().set_enable_ha(config.enable_ha);
 
     if (config.enable_metric_reporting) {
         metric_report_thread_ = std::thread([this]() {
@@ -86,13 +85,11 @@ void WrappedMasterService::init_http_server() {
                     if (replicas[i].is_memory_replica()) {
                         auto& memory_descriptors =
                             replicas[i].get_memory_descriptor();
-                        for (const auto& handle :
-                             memory_descriptors.buffer_descriptors) {
-                            std::string tmp = "";
-                            struct_json::to_json(handle, tmp);
-                            ss += tmp;
-                            ss += "\n";
-                        }
+                        std::string tmp = "";
+                        struct_json::to_json(
+                            memory_descriptors.buffer_descriptor, tmp);
+                        ss += tmp;
+                        ss += "\n";
                     }
                 }
                 resp.set_status_and_content(status_type::ok, std::move(ss));
@@ -174,6 +171,11 @@ void WrappedMasterService::init_http_server() {
     LOG(INFO) << "HTTP metrics server started on port " << http_server_.port();
 }
 
+tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+WrappedMasterService::CalcCacheStats() {
+    return MasterMetricManager::instance().calculate_cache_stats();
+}
+
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key) {
     return execute_rpc(
@@ -213,6 +215,85 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     timer.LogResponse("total=", result.size(),
                       ", success=", result.size() - failure_count,
                       ", failures=", failure_count);
+    return result;
+}
+
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "BatchQueryIp");
+    const size_t total_client_ids = client_ids.size();
+    timer.LogRequest("client_ids_count=", total_client_ids);
+    MasterMetricManager::instance().inc_batch_query_ip_requests(
+        total_client_ids);
+
+    auto result = master_service_.BatchQueryIp(client_ids);
+
+    size_t failure_count = 0;
+    if (!result.has_value()) {
+        failure_count = total_client_ids;
+    } else {
+        for (size_t i = 0; i < client_ids.size(); ++i) {
+            const auto& client_id = client_ids[i];
+            if (result.value().find(client_id) == result.value().end()) {
+                failure_count++;
+                VLOG(1) << "BatchQueryIp failed for client_id[" << i << "] '"
+                        << client_id << "': not found in results";
+            }
+        }
+    }
+
+    if (failure_count == total_client_ids) {
+        MasterMetricManager::instance().inc_batch_query_ip_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_query_ip_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponse("total=", total_client_ids,
+                      ", success=", total_client_ids - failure_count,
+                      ", failures=", failure_count);
+    return result;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "BatchReplicaClear");
+    const size_t total_keys = object_keys.size();
+    timer.LogRequest("object_keys_count=", total_keys,
+                     ", client_id=", client_id,
+                     ", segment_name=", segment_name);
+    MasterMetricManager::instance().inc_batch_replica_clear_requests(
+        total_keys);
+
+    auto result =
+        master_service_.BatchReplicaClear(object_keys, client_id, segment_name);
+
+    size_t failure_count = 0;
+    if (!result.has_value()) {
+        failure_count = total_keys;
+        LOG(WARNING) << "BatchReplicaClear failed: "
+                     << toString(result.error());
+    } else {
+        const size_t cleared_count = result.value().size();
+        failure_count = total_keys - cleared_count;
+        timer.LogResponse("total=", total_keys, ", cleared=", cleared_count,
+                          ", failed=", failure_count);
+    }
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_replica_clear_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_replica_clear_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -292,17 +373,17 @@ WrappedMasterService::BatchGetReplicaList(
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
-                               const std::vector<uint64_t>& slice_lengths,
+                               const uint64_t slice_length,
                                const ReplicateConfig& config) {
     return execute_rpc(
         "PutStart",
         [&] {
-            return master_service_.PutStart(client_id, key, slice_lengths,
+            return master_service_.PutStart(client_id, key, slice_length,
                                             config);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
-                             ", slice_lengths=", slice_lengths.size());
+                             ", slice_length=", slice_length);
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
@@ -335,10 +416,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-WrappedMasterService::BatchPutStart(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<std::vector<uint64_t>>& slice_lengths,
-    const ReplicateConfig& config) {
+WrappedMasterService::BatchPutStart(const UUID& client_id,
+                                    const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& slice_lengths,
+                                    const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -351,24 +432,17 @@ WrappedMasterService::BatchPutStart(
     if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto& slice_lens = slice_lengths[i];
-            std::vector<uint64_t> alloc_slice_lens;
-            size_t all_slice_len = 0;
-            for (auto& slice_len : slice_lens) {
-                all_slice_len += slice_len;
-            }
-            alloc_slice_lens.emplace_back(all_slice_len);
             auto result = master_service_.PutStart(
-                client_id, keys[i], alloc_slice_lens, new_config);
+                client_id, keys[i], slice_lengths[i], new_config);
             results.emplace_back(result);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
                 for (const auto& replica : result.value()) {
                     if (replica.is_memory_replica()) {
                         auto handles =
-                            replica.get_memory_descriptor().buffer_descriptors;
-                        if (!handles.empty()) {
-                            preferred_segment = handles[0].transport_endpoint_;
+                            replica.get_memory_descriptor().buffer_descriptor;
+                        if (!handles.transport_endpoint_.empty()) {
+                            preferred_segment = handles.transport_endpoint_;
                         }
                     }
                 }
@@ -576,6 +650,17 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     return result;
 }
 
+tl::expected<GetStorageConfigResponse, ErrorCode>
+WrappedMasterService::GetStorageConfig() {
+    ScopedVLogTimer timer(1, "GetStorageConfig");
+    timer.LogRequest("action=get_storage_config");
+
+    auto result = master_service_.GetStorageConfig();
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     const UUID& client_id) {
     ScopedVLogTimer timer(1, "Ping");
@@ -589,14 +674,54 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     return result;
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::ServiceReady() {
-    return {};
+tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
+    return GetMooncakeStoreVersion();
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MountLocalDiskSegment");
+    timer.LogRequest("action=mount_local_disk_segment");
+    LOG(INFO) << "Mount local disk segment with client id is : " << client_id
+              << ", enable offloading is: " << enable_offloading;
+    auto result =
+        master_service_.MountLocalDiskSegment(client_id, enable_offloading);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::unordered_map<std::string, int64_t, std::hash<std::string>>,
+             ErrorCode>
+WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
+                                             bool enable_offloading) {
+    ScopedVLogTimer timer(1, "OffloadObjectHeartbeat");
+    timer.LogRequest("action=offload_object_heartbeat");
+    auto result =
+        master_service_.OffloadObjectHeartbeat(client_id, enable_offloading);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "NotifyOffloadSuccess");
+    timer.LogRequest("action=notify_offload_success");
+
+    auto result =
+        master_service_.NotifyOffloadSuccess(client_id, keys, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
 }
 
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchReplicaClear>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
@@ -634,9 +759,21 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
+        &wrapped_master_service);
+
+    server.register_handler<
+        &mooncake::WrappedMasterService::MountLocalDiskSegment>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
         &wrapped_master_service);
 }
 

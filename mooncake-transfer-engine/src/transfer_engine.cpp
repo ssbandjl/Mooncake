@@ -16,15 +16,20 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <sys/resource.h>
 #include <unistd.h>
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#include "transport/barex_transport/barex_transport.h"
 
 namespace mooncake {
 
@@ -72,6 +77,15 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                         "files are opened.";
     }
     // Set resources to the maximum value
+#ifdef USE_BAREX
+    const char *use_barex_env = std::getenv("USE_BAREX");
+    if (use_barex_env) {
+        int val = atoi(use_barex_env);
+        if (val != 0) {
+            use_barex_ = true;
+        }
+    }
+#endif
 
 #ifdef USE_ASCEND
     // The only difference in initializing the Ascend Transport is that the
@@ -99,7 +113,19 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         desc.ip_or_host_name = host_name;
         desc.rpc_port = port;
         desc.sockfd = -1;
-
+#ifdef USE_BAREX
+        if (use_barex_) {
+            int tmp_fd = -1;
+            desc.barex_port = findAvailableTcpPort(tmp_fd, true);
+            if (desc.barex_port == 0) {
+                LOG(ERROR)
+                    << "Barex: No valid port found for local barex service.";
+                return -1;
+            }
+            close(tmp_fd);
+            tmp_fd = -1;
+        }
+#endif
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
             desc.rpc_port = findAvailableTcpPort(desc.sockfd);
@@ -145,7 +171,13 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     LOG(INFO) << "Transfer Engine RPC using " << rpc_binding_method
               << ", listening on " << desc.ip_or_host_name << ":"
-              << desc.rpc_port;
+              << desc.rpc_port
+#ifdef USE_BAREX
+              << (use_barex_
+                      ? ", barex use port:" + std::to_string(desc.barex_port)
+                      : "")
+#endif
+              << "";
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
 #ifdef USE_ASCEND
@@ -217,22 +249,46 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                 return -1;
             }
         } else {
+#ifdef USE_HIP
+            Transport *hip_transport =
+                multi_transports_->installTransport("hip", nullptr);
+            if (!hip_transport) {
+                LOG(ERROR) << "Failed to install HIP transport";
+                return -1;
+            }
+#else
             Transport *nvlink_transport =
                 multi_transports_->installTransport("nvlink", nullptr);
             if (!nvlink_transport) {
                 LOG(ERROR) << "Failed to install NVLink transport";
                 return -1;
             }
+#endif
         }
 #else
         if (local_topology_->getHcaList().size() > 0 &&
             !getenv("MC_FORCE_TCP")) {
             // only install RDMA transport when there is at least one HCA
-            Transport *rdma_transport =
-                multi_transports_->installTransport("rdma", local_topology_);
-            if (!rdma_transport) {
-                LOG(ERROR) << "Failed to install RDMA transport";
+            Transport *rdma_transport = nullptr;
+            if (use_barex_) {
+#ifdef USE_BAREX
+                rdma_transport = multi_transports_->installTransport(
+                    "barex", local_topology_);
+#else
+                LOG(ERROR) << "Set USE BAREX while barex not compiled";
                 return -1;
+#endif
+            } else {
+                rdma_transport = multi_transports_->installTransport(
+                    "rdma", local_topology_);
+            }
+            if (rdma_transport == nullptr) {
+                LOG(ERROR) << "Failed to install RDMA transport, type="
+                           << (use_barex_ ? "barex" : "rdma");
+                return -1;
+            } else {
+                LOG(INFO) << "installTransport, type="
+                          << (use_barex_ ? "barex" : "rdma");
             }
         } else {
             Transport *tcp_transport =
@@ -328,7 +384,37 @@ Transport::SegmentHandle TransferEngine::openSegment(
     while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
         trimmed_segment_name.erase(0, 1);
     if (trimmed_segment_name.empty()) return ERR_INVALID_ARGUMENT;
-    return metadata_->getSegmentID(trimmed_segment_name);
+    SegmentID sid = metadata_->getSegmentID(trimmed_segment_name);
+#ifdef USE_BAREX
+    if (use_barex_) {
+        Transport *transport = multi_transports_->getTransport("barex");
+        if (!transport) {
+            LOG(ERROR) << "Barex proto not installed";
+            return (Transport::SegmentHandle)-1;
+        }
+        Status s = transport->OpenChannel(segment_name, sid);
+        if (!s.ok()) {
+            LOG(ERROR) << "openSegment, OpenChannel failed";
+            return (Transport::SegmentHandle)-1;
+        }
+    }
+#endif
+    return sid;
+}
+
+Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
+#ifdef USE_BAREX
+    if (use_barex_) {
+        Transport *transport = multi_transports_->getTransport("barex");
+        BarexTransport *barex_transport =
+            dynamic_cast<BarexTransport *>(transport);
+        return barex_transport->CheckStatus(sid);
+    } else {
+        return Status::OK();
+    }
+#else
+    return Status::OK();
+#endif
 }
 
 int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }
@@ -448,6 +534,35 @@ static std::string toLower(const std::string &s) {
     return result;
 }
 
+void TransferEngine::RecordTaskStart(BatchID batch_id, size_t task_id) {
+    uint64_t task_key = MakeTaskKey(batch_id, task_id);
+    std::lock_guard<std::mutex> lock(task_timing_mutex_);
+    auto it = task_start_times_.find(task_key);
+    if (it == task_start_times_.end()) {
+        TaskTimingInfo info;
+        info.start_time = std::chrono::steady_clock::now();
+        info.is_started = true;
+        task_start_times_[task_key] = info;
+    }
+}
+
+void TransferEngine::RecordTaskCompletion(BatchID batch_id, size_t task_id) {
+    uint64_t task_key = MakeTaskKey(batch_id, task_id);
+    auto completion_time = std::chrono::steady_clock::now();
+
+    std::lock_guard<std::mutex> lock(task_timing_mutex_);
+    auto it = task_start_times_.find(task_key);
+    if (it != task_start_times_.end() && it->second.is_started) {
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            completion_time - it->second.start_time);
+        int64_t latency_us = duration.count();
+
+        task_completion_latency_us_.observe(latency_us);
+
+        task_start_times_.erase(it);
+    }
+}
+
 void TransferEngine::InitializeMetricsConfig() {
     // Check if metrics reporting is enabled via environment variable
     const char *metric_env = getenv("MC_TE_METRIC");
@@ -489,6 +604,14 @@ void TransferEngine::StartMetricsReportingThread() {
     }
 
     should_stop_metrics_thread_ = false;
+
+    // Initialize previous bucket counts
+    {
+        std::lock_guard<std::mutex> lock(metrics_snapshot_mutex_);
+        auto bucket_counts = task_completion_latency_us_.get_bucket_counts();
+        prev_bucket_counts_.resize(bucket_counts.size(), 0);
+    }
+
     metrics_reporting_thread_ = std::thread([this]() {
         LOG(INFO) << "Metrics reporting thread started (interval: "
                   << metrics_interval_seconds_ << "s)";
@@ -511,19 +634,104 @@ void TransferEngine::StartMetricsReportingThread() {
             transferred_bytes_counter_
                 .reset();  // Reset counter for the next interval
 
-            if (bytes_transferred_in_interval == 0) {
+            // Calculate throughput
+            bool has_throughput = (bytes_transferred_in_interval > 0);
+            double throughput_megabytes_per_second = 0.0;
+            if (has_throughput) {
+                throughput_megabytes_per_second =
+                    static_cast<double>(bytes_transferred_in_interval) /
+                    (metrics_interval_seconds_ * kBytesPerMegabyte);
+            }
+
+            // Calculate task completion latency statistics for this interval
+            auto bucket_counts =
+                task_completion_latency_us_.get_bucket_counts();
+
+            // Compute interval counts (delta from previous snapshot)
+            std::vector<int64_t> interval_counts;
+            int64_t total_task_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(metrics_snapshot_mutex_);
+                interval_counts.resize(bucket_counts.size());
+
+                for (size_t i = 0; i < bucket_counts.size(); ++i) {
+                    int64_t current_count = bucket_counts[i]->value();
+                    int64_t prev_count = (i < prev_bucket_counts_.size())
+                                             ? prev_bucket_counts_[i]
+                                             : 0;
+                    interval_counts[i] = current_count - prev_count;
+                    total_task_count += interval_counts[i];
+
+                    // Update previous snapshot
+                    if (i < prev_bucket_counts_.size()) {
+                        prev_bucket_counts_[i] = current_count;
+                    } else {
+                        prev_bucket_counts_.push_back(current_count);
+                    }
+                }
+            }
+
+            bool has_latency = (total_task_count > 0);
+
+            // Skip if no data to report
+            if (!has_throughput && !has_latency) {
                 continue;
             }
 
-            // Calculate throughput in MB/s for better readability
-            double throughput_megabytes_per_second =
-                static_cast<double>(bytes_transferred_in_interval) /
-                (metrics_interval_seconds_ * kBytesPerMegabyte);
+            // Build metrics log message
+            std::stringstream log_msg;
+            log_msg << "[Metrics] Transfer Engine Stats (over last "
+                    << metrics_interval_seconds_ << "s):";
 
-            LOG(INFO) << "[Metrics] Transfer Engine Throughput: " << std::fixed
-                      << std::setprecision(2) << throughput_megabytes_per_second
-                      << " MB/s (over last " << metrics_interval_seconds_
-                      << "s)";
+            if (has_throughput) {
+                log_msg << " Throughput: " << std::fixed << std::setprecision(2)
+                        << throughput_megabytes_per_second << " MB/s";
+            }
+
+            if (!has_latency) {
+                LOG(INFO) << log_msg.str();
+                continue;
+            }
+
+            // Append latency distribution
+            log_msg << " | Latency Distribution (count=" << total_task_count
+                    << "): ";
+
+            bool first = true;
+            for (size_t i = 0; i < interval_counts.size(); ++i) {
+                int64_t count = interval_counts[i];
+                if (count <= 0) continue;
+
+                double percentage = (count * 100.0) / total_task_count;
+                constexpr double kMinPercentageThreshold = 0.1;
+                if (percentage < kMinPercentageThreshold) continue;
+
+                // Add separator between entries
+                if (!first) {
+                    log_msg << ", ";
+                }
+                first = false;
+
+                // Format and append bucket range with percentage
+                bool is_overflow_bucket = (i >= kTaskLatencyBuckets.size());
+                if (is_overflow_bucket) {
+                    int threshold =
+                        static_cast<int>(kTaskLatencyBuckets.back());
+                    log_msg << ">" << threshold << "μs";
+                } else {
+                    int lower = 0;
+                    if (i > 0) {
+                        lower = static_cast<int>(kTaskLatencyBuckets[i - 1]);
+                    }
+                    int upper = static_cast<int>(kTaskLatencyBuckets[i]);
+                    log_msg << lower << "-" << upper << "μs";
+                }
+
+                log_msg << ":" << std::fixed << std::setprecision(1)
+                        << percentage << "%";
+            }
+
+            LOG(INFO) << log_msg.str();
         }
         LOG(INFO) << "Metrics reporting thread stopped";
     });
